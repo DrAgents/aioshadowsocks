@@ -11,34 +11,34 @@ from shadowsocks.utils import parse_header
 
 
 class TimeoutHandler:
-    def __init__(self):
-        self._transport = None
-        self._last_active_time = time.time()
-        self._timeout_limit = current_app.timeout_limit
+  def __init__(self):
+    self._transport = None
+    self._last_active_time = time.time()
+    self._timeout_limit = current_app.timeout_limit
 
-        self._is_cancelled = False
+    self._is_cancelled = False
 
-    def close(self):
-        raise NotImplementedError
+  def close(self):
+    raise NotImplementedError
 
-    def check_conn_timeout(self):
-        asyncio.create_task(self._check_conn_timeout())
+  def check_conn_timeout(self):
+    asyncio.create_task(self._check_conn_timeout())
 
-    def keep_alive_active(self):
-        self._last_active_time = time.time()
+  def keep_alive_active(self):
+    self._last_active_time = time.time()
 
-    async def _check_conn_timeout(self):
-        while not self._is_cancelled:
-            current_time = time.time()
-            if current_time - self._last_active_time > self._timeout_limit:
-                self.close()
-                break
-            else:
-                await asyncio.sleep(2)
+  async def _check_conn_timeout(self):
+    while not self._is_cancelled:
+      current_time = time.time()
+      if current_time - self._last_active_time > self._timeout_limit:
+        self.close()
+        break
+      else:
+        await asyncio.sleep(2)
 
 
 class LocalHandler(TimeoutHandler):
-    """
+  """
     事件循环一共处理五个状态
 
     STAGE_INIT  初始状态 socket5握手
@@ -48,385 +48,362 @@ class LocalHandler(TimeoutHandler):
     STAGE_ERROR 异常状态
     """
 
-    STAGE_INIT = 0
-    STAGE_CONNECT = 1
-    STAGE_STREAM = 2
-    STAGE_DESTROY = -1
-    STAGE_ERROR = 255
+  STAGE_INIT = 0
+  STAGE_CONNECT = 1
+  STAGE_STREAM = 2
+  STAGE_DESTROY = -1
+  STAGE_ERROR = 255
 
-    USER_TCP_CONN_LIMIT = current_app.user_tcp_conn_limit
+  USER_TCP_CONN_LIMIT = current_app.user_tcp_conn_limit
 
-    def __init__(self, user):
-        TimeoutHandler.__init__(self)
+  def __init__(self, user):
+    TimeoutHandler.__init__(self)
 
-        self.user = user
-        self.server = user.server
+    self.user = user
+    self.server = user.server
 
-        self._stage = self.STAGE_DESTROY
-        self._peername = None
+    self._stage = self.STAGE_DESTROY
+    self._peername = None
+    self._remote = None
+    self._cryptor = None
+    self._transport = None
+    self._transport_protocol = None
+    self._is_closing = False
+
+  def _init_transport(self, transport, peername, protocol):
+    self._stage = self.STAGE_INIT
+    self._transport = transport
+    self._peername = peername
+    self._transport_protocol = protocol
+
+  def _init_cryptor(self):
+    try:
+      self._cryptor = Cryptor(self.user.method, self.user.password, self._transport_protocol)
+      logging.debug("tcp connection made")
+    except NotImplementedError:
+      self.close()
+      logging.warning("not support cipher")
+
+  def close(self):
+    if self._is_closing:
+      return
+    self._stage = self.STAGE_DESTROY
+    self._is_cancelled = True
+    self._is_closing = True
+    if self._transport_protocol == flag.TRANSPORT_TCP:
+      self.server.incr_tcp_conn_num(-1)
+      self._transport and self._transport.close()
+      if self._remote:
+        self._remote.close()
+        # NOTE for circular reference
         self._remote = None
-        self._cryptor = None
-        self._transport = None
-        self._transport_protocol = None
-        self._is_closing = False
+    elif self._transport_protocol == flag.TRANSPORT_UDP:
+      pass
+    else:
+      raise NotImplementedError
 
-    def _init_transport(self, transport, peername, protocol):
-        self._stage = self.STAGE_INIT
-        self._transport = transport
-        self._peername = peername
-        self._transport_protocol = protocol
+  def write(self, data):
+    if not self._transport or self._transport.is_closing():
+      self._transport and self._transport.abort()
+      return
+    if self._transport_protocol == flag.TRANSPORT_TCP:
+      self._transport.write(data)
+    elif self._transport_protocol == flag.TRANSPORT_UDP:
+      # get the remote address to which the socket is connected
+      self._transport.sendto(data, self._peername)
+    else:
+      raise NotImplementedError
 
-    def _init_cryptor(self):
-        try:
-            self._cryptor = Cryptor(
-                self.user.method, self.user.password, self._transport_protocol
-            )
-            logging.debug("tcp connection made")
-        except NotImplementedError:
-            self.close()
-            logging.warning("not support cipher")
+  def handle_tcp_connection_made(self, transport, peername):
+    self._init_transport(transport, peername, flag.TRANSPORT_TCP)
+    now_tcp_num = self.server.tcp_conn_num
+    if now_tcp_num > self.USER_TCP_CONN_LIMIT:
+      logging.warning(f"user: {self.user} reach tcp_conn_limit current :{now_tcp_num}")
+      self.close()
+    else:
+      self._init_cryptor()
+      self.check_conn_timeout()
 
-    def close(self):
-        if self._is_closing:
-            return
+  def handle_udp_connection_made(self, transport, peername):
+    self._init_transport(transport, peername, flag.TRANSPORT_UDP)
+    self._init_cryptor()
+
+  def handle_eof_received(self):
+    self.close()
+    logging.debug("eof received")
+
+  def handle_connection_lost(self, exc):
+    self.close()
+    logging.debug(f"lost exc={exc}")
+
+  def handle_data_received(self, data):
+    try:
+      data = self._cryptor.decrypt(data)
+    except Exception as e:
+      self.close()
+      logging.warning(f"decrypt data error {e}")
+      return
+
+    if self._stage == self.STAGE_INIT:
+      coro = self._handle_stage_init(data)
+      asyncio.create_task(coro)
+    elif self._stage == self.STAGE_CONNECT:
+      coro = self._handle_stage_connect(data)
+      asyncio.create_task(coro)
+    elif self._stage == self.STAGE_STREAM:
+      self._handle_stage_stream(data)
+    elif self._stage == self.STAGE_ERROR:
+      self._handle_stage_error()
+    else:
+      logging.warning(f"unknown stage:{self._stage}")
+
+  async def _handle_stage_init(self, data):
+    try:
+      addr_type, dst_addr, dst_port, header_length = parse_header(data)
+    except Exception as e:
+      self.close()
+      logging.warning(f"parse header error: {str(e)}")
+      return
+    if not dst_addr:
+      self.close()
+      logging.warning("can't parse addr_type: {} user: {} CMD: {}".format(addr_type, self.user,
+                                                                          self._transport_protocol))
+      return
+    else:
+      payload = data[header_length:]
+    loop = asyncio.get_event_loop()
+    if self._transport_protocol == flag.TRANSPORT_TCP:
+      self._stage = self.STAGE_CONNECT
+
+      # 尝试建立tcp连接，成功的话将会返回 (transport,protocol)
+      tcp_coro = loop.create_connection(lambda: RemoteTCP(dst_addr, dst_port, payload, self), dst_addr, dst_port)
+      try:
+        _, remote_tcp = await tcp_coro
+      except (IOError, OSError) as e:
+        self.close()
         self._stage = self.STAGE_DESTROY
-        self._is_cancelled = True
-        self._is_closing = True
-        if self._transport_protocol == flag.TRANSPORT_TCP:
-            self.server.incr_tcp_conn_num(-1)
-            self._transport and self._transport.close()
-            if self._remote:
-                self._remote.close()
-                # NOTE for circular reference
-                self._remote = None
-        elif self._transport_protocol == flag.TRANSPORT_UDP:
-            pass
-        else:
-            raise NotImplementedError
-
-    def write(self, data):
-        if not self._transport or self._transport.is_closing():
-            self._transport and self._transport.abort()
-            return
-        if self._transport_protocol == flag.TRANSPORT_TCP:
-            self._transport.write(data)
-        elif self._transport_protocol == flag.TRANSPORT_UDP:
-            # get the remote address to which the socket is connected
-            self._transport.sendto(data, self._peername)
-        else:
-            raise NotImplementedError
-
-    def handle_tcp_connection_made(self, transport, peername):
-        self._init_transport(transport, peername, flag.TRANSPORT_TCP)
-        now_tcp_num = self.server.tcp_conn_num
-        if now_tcp_num > self.USER_TCP_CONN_LIMIT:
-            logging.warning(
-                f"user: {self.user} reach tcp_conn_limit current :{now_tcp_num}"
-            )
-            self.close()
-        else:
-            self._init_cryptor()
-            self.check_conn_timeout()
-
-    def handle_udp_connection_made(self, transport, peername):
-        self._init_transport(transport, peername, flag.TRANSPORT_UDP)
-        self._init_cryptor()
-
-    def handle_eof_received(self):
+        logging.debug(f"connection failed , {type(e)} e: {e}")
+      except Exception as e:
+        self._stage = self.STAGE_ERROR
         self.close()
-        logging.debug("eof received")
-
-    def handle_connection_lost(self, exc):
+        logging.warning(f"connection failed, {type(e)} e: {e}")
+      else:
+        self._remote = remote_tcp
+        self._stage = self.STAGE_STREAM
+        logging.debug(f"connection established,remote {remote_tcp}")
+    elif self._transport_protocol == flag.TRANSPORT_UDP:
+      self._stage = self.STAGE_INIT
+      udp_coro = loop.create_datagram_endpoint(
+        lambda: RemoteUDP(dst_addr, dst_port, payload, self),
+        remote_addr=(dst_addr, dst_port),
+      )
+      try:
+        await udp_coro
+      except (IOError, OSError) as e:
         self.close()
-        logging.debug(f"lost exc={exc}")
-
-    def handle_data_received(self, data):
-        try:
-            data = self._cryptor.decrypt(data)
-        except Exception as e:
-            self.close()
-            logging.warning(f"decrypt data error {e}")
-            return
-
-        if self._stage == self.STAGE_INIT:
-            coro = self._handle_stage_init(data)
-            asyncio.create_task(coro)
-        elif self._stage == self.STAGE_CONNECT:
-            coro = self._handle_stage_connect(data)
-            asyncio.create_task(coro)
-        elif self._stage == self.STAGE_STREAM:
-            self._handle_stage_stream(data)
-        elif self._stage == self.STAGE_ERROR:
-            self._handle_stage_error()
-        else:
-            logging.warning(f"unknown stage:{self._stage}")
-
-    async def _handle_stage_init(self, data):
-        try:
-            addr_type, dst_addr, dst_port, header_length = parse_header(data)
-        except Exception as e:
-            self.close()
-            logging.warning(f"parse header error: {str(e)}")
-            return
-        if not dst_addr:
-            self.close()
-            logging.warning(
-                "can't parse addr_type: {} user: {} CMD: {}".format(
-                    addr_type, self.user, self._transport_protocol
-                )
-            )
-            return
-        else:
-            payload = data[header_length:]
-        loop = asyncio.get_event_loop()
-        if self._transport_protocol == flag.TRANSPORT_TCP:
-            self._stage = self.STAGE_CONNECT
-
-            # 尝试建立tcp连接，成功的话将会返回 (transport,protocol)
-            tcp_coro = loop.create_connection(
-                lambda: RemoteTCP(dst_addr, dst_port, payload, self), dst_addr, dst_port
-            )
-            try:
-                _, remote_tcp = await tcp_coro
-            except (IOError, OSError) as e:
-                self.close()
-                self._stage = self.STAGE_DESTROY
-                logging.debug(f"connection failed , {type(e)} e: {e}")
-            except Exception as e:
-                self._stage = self.STAGE_ERROR
-                self.close()
-                logging.warning(f"connection failed, {type(e)} e: {e}")
-            else:
-                self._remote = remote_tcp
-                self._stage = self.STAGE_STREAM
-                logging.debug(f"connection established,remote {remote_tcp}")
-        elif self._transport_protocol == flag.TRANSPORT_UDP:
-            self._stage = self.STAGE_INIT
-            udp_coro = loop.create_datagram_endpoint(
-                lambda: RemoteUDP(dst_addr, dst_port, payload, self),
-                remote_addr=(dst_addr, dst_port),
-            )
-            try:
-                await udp_coro
-            except (IOError, OSError) as e:
-                self.close()
-                self._stage = self.STAGE_DESTROY
-                logging.debug(f"connection failed , {type(e)} e: {e}")
-            except Exception as e:
-                self._stage = self.STAGE_ERROR
-                self.close()
-                logging.warning(f"connection failed, {type(e)} e: {e}")
-        else:
-            raise NotImplementedError
-
-    async def _handle_stage_connect(self, data):
-        # 在握手之后，会耗费一定时间来来和remote建立连接
-        # 但是ss-client并不会等这个时间 所以我们在这里手动sleep一会
-        sleep_time = 0.3
-        for i in range(10):
-            sleep_time += 0.1
-            if self._stage == self.STAGE_CONNECT:
-                await asyncio.sleep(sleep_time)
-            elif self._stage == self.STAGE_STREAM:
-                self._remote.write(data)
-                return
+        self._stage = self.STAGE_DESTROY
+        logging.debug(f"connection failed , {type(e)} e: {e}")
+      except Exception as e:
+        self._stage = self.STAGE_ERROR
         self.close()
-        logging.warning(
-            f"timeout to connect remote user: {self.user} peername: {self._peername}"
-        )
+        logging.warning(f"connection failed, {type(e)} e: {e}")
+    else:
+      raise NotImplementedError
 
-    def _handle_stage_stream(self, data):
-        self.keep_alive_active()
+  async def _handle_stage_connect(self, data):
+    # 在握手之后，会耗费一定时间来来和remote建立连接
+    # 但是ss-client并不会等这个时间 所以我们在这里手动sleep一会
+    sleep_time = 0.3
+    for i in range(10):
+      sleep_time += 0.1
+      if self._stage == self.STAGE_CONNECT:
+        await asyncio.sleep(sleep_time)
+      elif self._stage == self.STAGE_STREAM:
         self._remote.write(data)
-        logging.debug(f"relay data length {len(data)}")
+        return
+    self.close()
+    logging.warning(f"timeout to connect remote user: {self.user} peername: {self._peername}")
 
-    def _handle_stage_error(self):
-        self.close()
+  def _handle_stage_stream(self, data):
+    self.keep_alive_active()
+    self._remote.write(data)
+    logging.debug(f"relay data length {len(data)}")
+
+  def _handle_stage_error(self):
+    self.close()
 
 
 class LocalTCP(asyncio.Protocol):
-    """
+  """
     Local Tcp Factory
     """
 
-    def __init__(self, user):
-        self._handler = None
-        self.user = user
-        self.server = user.server
+  def __init__(self, user):
+    self._handler = None
+    self.user = user
+    self.server = user.server
 
-    def _init_handler(self):
-        if not self._handler:
-            self._handler = LocalHandler(self.user)
-        return self._handler
+  def _init_handler(self):
+    if not self._handler:
+      self._handler = LocalHandler(self.user)
+    return self._handler
 
-    def __call__(self):
-        local = LocalTCP(self.user)
-        local._init_handler()
-        return local
+  def __call__(self):
+    local = LocalTCP(self.user)
+    local._init_handler()
+    return local
 
-    def connection_made(self, transport):
-        self._transport = transport
-        peername = self._transport.get_extra_info("peername")
-        # NOTE 只记录 client->ss-local的ip和tcp_conn_num
-        self.server.record_ip(peername)
-        self.server.incr_tcp_conn_num(1)
-        self._handler.handle_tcp_connection_made(transport, peername)
+  def connection_made(self, transport):
+    self._transport = transport
+    peername = self._transport.get_extra_info("peername")
+    # NOTE 只记录 client->ss-local的ip和tcp_conn_num
+    self.server.record_ip(peername)
+    self.server.incr_tcp_conn_num(1)
+    self._handler.handle_tcp_connection_made(transport, peername)
 
-    def data_received(self, data):
-        self.server.record_traffic(used_u=len(data), used_d=0)
-        self._handler.handle_data_received(data)
+  def data_received(self, data):
+    self.server.record_traffic(used_u=len(data), used_d=0)
+    self._handler.handle_data_received(data)
 
-    def eof_received(self):
-        self._handler.handle_eof_received()
+  def eof_received(self):
+    self._handler.handle_eof_received()
 
-    def connection_lost(self, exc):
-        self._handler.handle_connection_lost(exc)
+  def connection_lost(self, exc):
+    self._handler.handle_connection_lost(exc)
 
 
 class LocalUDP(asyncio.DatagramProtocol):
-    """
+  """
     Local Tcp Factory
     """
 
-    def __init__(self, user):
-        self.user = user
-        self.server = user.server
-        self._protocols = {}
-        self._transport = None
+  def __init__(self, user):
+    self.user = user
+    self.server = user.server
+    self._protocols = {}
+    self._transport = None
 
-    def __call__(self):
-        local = LocalUDP(self.user)
-        return local
+  def __call__(self):
+    local = LocalUDP(self.user)
+    return local
 
-    def connection_made(self, transport):
-        self._transport = transport
+  def connection_made(self, transport):
+    self._transport = transport
 
-    def datagram_received(self, data, peername):
-        if peername in self._protocols:
-            handler = self._protocols[peername]
-        else:
-            handler = LocalHandler(self.user)
-            self._protocols[peername] = handler
-            handler.handle_udp_connection_made(self._transport, peername)
+  def datagram_received(self, data, peername):
+    if peername in self._protocols:
+      handler = self._protocols[peername]
+    else:
+      handler = LocalHandler(self.user)
+      self._protocols[peername] = handler
+      handler.handle_udp_connection_made(self._transport, peername)
 
-        self.server.record_traffic(used_u=len(data), used_d=0)
-        handler.handle_data_received(data)
+    self.server.record_traffic(used_u=len(data), used_d=0)
+    handler.handle_data_received(data)
 
-    def error_received(self, exc):
-        pass
+  def error_received(self, exc):
+    pass
 
 
 class RemoteTCP(asyncio.Protocol, TimeoutHandler):
-    def __init__(self, addr, port, data, local_handler):
-        TimeoutHandler.__init__(self)
+  def __init__(self, addr, port, data, local_handler):
+    TimeoutHandler.__init__(self)
 
-        self.data = data
-        self.local = local_handler
-        self.cryptor = Cryptor(
-            self.local.user.method, self.local.user.password, flag.TRANSPORT_TCP
-        )
+    self.data = data
+    self.local = local_handler
+    self.cryptor = Cryptor(self.local.user.method, self.local.user.password, flag.TRANSPORT_TCP)
 
-        self.peername = None
-        self._transport = None
+    self.peername = None
+    self._transport = None
 
-    def write(self, data):
-        if not self._transport or self._transport.is_closing():
-            self._transport and self._transport.abort()
-            return
+  def write(self, data):
+    if not self._transport or self._transport.is_closing():
+      self._transport and self._transport.abort()
+      return
 
-        self._transport.write(data)
+    self._transport.write(data)
 
-    def close(self):
-        self._is_cancelled = True
-        self._transport and self._transport.close()
-        # NOTE for circular reference
-        self.data = None
-        self.local = None
+  def close(self):
+    self._is_cancelled = True
+    self._transport and self._transport.close()
+    # NOTE for circular reference
+    self.data = None
+    self.local = None
 
-    def connection_made(self, transport):
-        self.check_conn_timeout()
+  def connection_made(self, transport):
+    self.check_conn_timeout()
 
-        self._transport = transport
-        self.peername = self._transport.get_extra_info("peername")
-        self.write(self.data)
-        logging.debug(
-            f"remote_tcp connection made, addr: {self.peername} user: {self.local.user}"
-        )
+    self._transport = transport
+    self.peername = self._transport.get_extra_info("peername")
+    self.write(self.data)
+    logging.debug(f"remote_tcp connection made, addr: {self.peername} user: {self.local.user}")
 
-    def data_received(self, data):
-        if self.local.server.check_traffic_rate(len(data)):
-            self.local.close()
-            return
-        self.keep_alive_active()
-        self.local.server.record_traffic(used_u=0, used_d=len(data))
-        self.local.write(self.cryptor.encrypt(data))
-        logging.debug(
-            f"remote_tcp {self} received data len: {len(data)} user: {self.local.user}"
-        )
+  def data_received(self, data):
+    if self.local.server.check_traffic_rate(len(data)):
+      self.local.close()
+      return
+    self.keep_alive_active()
+    self.local.server.record_traffic(used_u=0, used_d=len(data))
+    self.local.write(self.cryptor.encrypt(data))
+    logging.debug(f"remote_tcp {self} received data len: {len(data)} user: {self.local.user}")
 
-    def eof_received(self):
-        # NOTE tell ss-local
-        self.local and self.local.handle_eof_received()
-        self.close()
-        logging.debug("eof received")
+  def eof_received(self):
+    # NOTE tell ss-local
+    self.local and self.local.handle_eof_received()
+    self.close()
+    logging.debug("eof received")
 
-    def connection_lost(self, exc):
-        self.close()
-        logging.debug("lost exc={exc}".format(exc=exc))
+  def connection_lost(self, exc):
+    self.close()
+    logging.debug("lost exc={exc}".format(exc=exc))
 
 
 class RemoteUDP(asyncio.DatagramProtocol, TimeoutHandler):
-    def __init__(self, addr, port, data, local_hander):
-        TimeoutHandler.__init__(self)
-        self.data = data
-        self.local = local_hander
-        self.cryptor = Cryptor(
-            self.local.user.method, self.local.user.password, flag.TRANSPORT_UDP
-        )
+  def __init__(self, addr, port, data, local_hander):
+    TimeoutHandler.__init__(self)
+    self.data = data
+    self.local = local_hander
+    self.cryptor = Cryptor(self.local.user.method, self.local.user.password, flag.TRANSPORT_UDP)
 
-        self.peername = None
-        self._transport = None
+    self.peername = None
+    self._transport = None
 
-    def write(self, data):
-        self._transport and self._transport.sendto(data, self.peername)
+  def write(self, data):
+    self._transport and self._transport.sendto(data, self.peername)
 
-    def close(self):
-        self._is_cancelled = True
-        self._transport and self._transport.close()
-        # NOTE for circular reference
-        self.data = None
-        self.local = None
+  def close(self):
+    self._is_cancelled = True
+    self._transport and self._transport.close()
+    # NOTE for circular reference
+    self.data = None
+    self.local = None
 
-    def connection_made(self, transport):
-        self.check_conn_timeout()
-        self._transport = transport
-        self.peername = self._transport.get_extra_info("peername")
-        self.write(self.data)
-        logging.debug(
-            f"remote_udp connection made, addr: {self.peername} user: {self.local.user}"
-        )
+  def connection_made(self, transport):
+    self.check_conn_timeout()
+    self._transport = transport
+    self.peername = self._transport.get_extra_info("peername")
+    self.write(self.data)
+    logging.debug(f"remote_udp connection made, addr: {self.peername} user: {self.local.user}")
 
-    def datagram_received(self, data, peername, *arg):
-        self.keep_alive_active()
+  def datagram_received(self, data, peername, *arg):
+    self.keep_alive_active()
 
-        logging.debug(
-            f"remote_udp {self} received data len: {len(data)} user: {self.local.user}"
-        )
+    logging.debug(f"remote_udp {self} received data len: {len(data)} user: {self.local.user}")
 
-        assert self.peername == peername
-        # 源地址和端口
-        bind_addr = peername[0]
-        bind_port = peername[1]
-        addr = socket.inet_pton(socket.AF_INET, bind_addr)
-        port = struct.pack("!H", bind_port)
-        # 构造返回的报文结构
-        data = b"\x01" + addr + port + data
-        data = self.cryptor.encrypt(data)
-        self.local.server.record_traffic(used_u=0, used_d=len(data))
-        self.local.write(data)
+    assert self.peername == peername
+    # 源地址和端口
+    bind_addr = peername[0]
+    bind_port = peername[1]
+    addr = socket.inet_pton(socket.AF_INET, bind_addr)
+    port = struct.pack("!H", bind_port)
+    # 构造返回的报文结构
+    data = b"\x01" + addr + port + data
+    data = self.cryptor.encrypt(data)
+    self.local.server.record_traffic(used_u=0, used_d=len(data))
+    self.local.write(data)
 
-    def error_received(self, exc):
-        logging.debug("error received exc {}".format(exc))
+  def error_received(self, exc):
+    logging.debug("error received exc {}".format(exc))
 
-    def connection_lost(self, exc):
-        logging.debug("udp connetcion lost exc {}".format(exc))
+  def connection_lost(self, exc):
+    logging.debug("udp connetcion lost exc {}".format(exc))

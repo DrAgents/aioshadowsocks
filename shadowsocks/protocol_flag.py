@@ -12,7 +12,6 @@ shadowsocks 报文结构
 TRANSPORT_TCP = 0x01
 TRANSPORT_UDP = 0x02
 
-
 # ATYPS
 ATYPE_IPV4 = 0x01
 ATYPE_IPV6 = 0x04
