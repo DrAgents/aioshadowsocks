@@ -103,6 +103,6 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-# vscode
-.vscode/
-dev/
+# # vscode
+# .vscode/
+# dev/
