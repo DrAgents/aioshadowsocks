@@ -47,6 +47,16 @@
 
 init_user_servers 初始化用户的 ss 服务器.
 
+定义了 UserServer 模型
+
+| 字段     | 说明        |
+| -------- | ----------- |
+| user_id  | 用户 ID     |
+| port     | ss 端口     |
+| method   | ss 加密方法 |
+| password | 密码        |
+| enable   | 是否启用    |
+
 ## json_server
 
 配置文件是 `./userconfigs.json`.
